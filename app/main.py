@@ -1,6 +1,6 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional, Dict
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
+from typing import Optional, Dict, List
 import os, csv, json, re, unicodedata
 from rapidfuzz import process, fuzz
 
@@ -68,9 +68,9 @@ def normalize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
-    s = re.sub(r"[()]", " ", s)
-    s = re.sub(r"[\.\-_/]", " ", s)
-    s = re.sub(r"\b&\b", " and ", s)
+    s = re.sub(r"[()]", " ", s)      # drop parentheses for matching
+    s = re.sub(r"[\.\-_/]", " ", s)  # break punctuation
+    s = re.sub(r"\b&\b", " and ", s) # & -> and
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -98,7 +98,7 @@ class Matcher:
 
                 base = re.sub(r"\s*\([^)]*\)", "", lbl).strip()
                 nbase = normalize(base)
-                clbl = compact(nlbl)
+                clbl  = compact(nlbl)
                 cbase = compact(nbase)
 
                 if nbase:
@@ -108,6 +108,7 @@ class Matcher:
                 if clbl:
                     self.auto_aliases[qid].setdefault(clbl, lbl)
 
+            # merge manual aliases
             for raw_alias, canonical in self.manual_aliases.get(qid, {}).items():
                 na = normalize(raw_alias)
                 if canonical in self.codeframes[qid]:
@@ -116,7 +117,7 @@ class Matcher:
 
     def match(self, qid: str, verbatim: str):
         if not verbatim or not verbatim.strip():
-            # empty input for Q1a → 97 (None)
+            # Q1a: empty → 97 (None)
             if qid == "Q1a":
                 return ("None", 97, 1.0, "rule-empty", None, [])
             return None
@@ -128,23 +129,19 @@ class Matcher:
         norm_text = normalize(text)
         ctext = compact(norm_text)
 
-        # =============================
-        # Q1a special rules
-        # =============================
+        # ===== Q1a special rules =====
         if qid == "Q1a":
-            # 1) Cyrillic
+            # Cyrillic letters
             if re.search(r"[\u0400-\u04FF]", text):
                 return ("Cyrillic", 95, 1.0, "rule-cyrillic", None, [])
-            # 2) No / none / nothing
+            # no/none/nothing
             if re.search(r"\b(no|none|nothing)\b", norm_text):
                 return ("None", 97, 1.0, "rule-none", None, [])
-            # 3) Don't know / dk / no idea
+            # dk / don't know / no idea
             if re.search(r"\b(dk|don.?t know|dont know|no idea)\b", norm_text):
                 return ("DontKnow", 99, 1.0, "rule-dk", None, [])
 
-        # =============================
-        # Normal alias / substring / fuzzy
-        # =============================
+        # ===== normal alias / substring / fuzzy =====
         labels_map = self.codeframes[qid]
         canon_labels = list(labels_map.keys())
         if not canon_labels:
@@ -153,6 +150,7 @@ class Matcher:
             return None
 
         aliases = self.auto_aliases.get(qid, {})
+        # exact alias hits
         if norm_text in aliases:
             canonical = aliases[norm_text]
             _, code = labels_map[canonical]
@@ -161,11 +159,13 @@ class Matcher:
             canonical = aliases[ctext]
             _, code = labels_map[canonical]
             return (canonical, code, 0.99, "alias", ctext, [(canonical, 99)])
+        # alias substring
         for a, canonical in aliases.items():
             if a and (a in norm_text or a in ctext):
                 _, code = labels_map[canonical]
                 return (canonical, code, 0.96, "alias-sub", a, [(canonical, 96)])
 
+        # bidirectional substring on canonical labels
         for label in canon_labels:
             nlbl = self.norm_labels[qid][label]
             if not nlbl:
@@ -175,6 +175,7 @@ class Matcher:
                 _, code = labels_map[label]
                 return (label, code, 0.92, "substring", nlbl, [(label, 92)])
 
+        # fuzzy (with score_cutoff support)
         def scorer(q, choice, *, score_cutoff=0):
             s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
             s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
@@ -197,7 +198,7 @@ class Matcher:
                     [(lab, int(sc)) for (lab, sc, __) in extracted],
                 )
 
-        # Fallback for Q1a
+        # Q1a fallback → 98 (Other)
         if qid == "Q1a":
             return ("Other", 98, 1.0, "rule-fallback", None, [])
 
@@ -207,7 +208,7 @@ class Matcher:
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Autocoder API", version="1.2.0")
+app = FastAPI(title="Autocoder API", version="1.3.0")
 STATE: Dict[str, object] = {"matcher": None}
 
 def init():
@@ -216,6 +217,8 @@ def init():
     STATE["matcher"] = Matcher(codeframes, aliases)
 
 init()
+
+# ---------- Models ----------
 
 class AutocodeRequest(BaseModel):
     question_id: str
@@ -230,6 +233,35 @@ class AutocodeResponse(BaseModel):
     method: Optional[str]
     matched_alias_or_term: Optional[str]
     extras: Optional[Dict] = None
+
+class BatchAutocodeRequest(BaseModel):
+    question_id: str = Field(..., description="CSV filename without .csv")
+    verbatims: List[str] = Field(..., description="Up to 10 verbatims")
+
+    @validator("verbatims")
+    def validate_verbatims(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("verbatims must be a list of strings")
+        if len(v) == 0:
+            raise ValueError("verbatims must contain at least 1 item")
+        if len(v) > 10:
+            raise ValueError("verbatims cannot exceed 10 items")
+        return v
+
+class BatchAutocodeItem(BaseModel):
+    input: str
+    matched_label: Optional[str]
+    code: Optional[int]
+    confidence: float
+    method: Optional[str]
+    matched_alias_or_term: Optional[str]
+    extras: Optional[Dict] = None
+
+class BatchAutocodeResponse(BaseModel):
+    question_id: str
+    results: List[BatchAutocodeItem]
+
+# ---------- Endpoints ----------
 
 @app.get("/health")
 def health():
@@ -255,6 +287,7 @@ def autocode(payload: AutocodeRequest):
         m: Matcher = STATE["matcher"]  # type: ignore
         res = m.match(payload.question_id, payload.verbatim)
     except Exception as e:
+        # fail-soft
         return AutocodeResponse(
             question_id=payload.question_id,
             input=payload.verbatim,
@@ -289,3 +322,54 @@ def autocode(payload: AutocodeRequest):
         matched_alias_or_term=term,
         extras={"top_candidates": top},
     )
+
+@app.post("/autocode/batch", response_model=BatchAutocodeResponse)
+def autocode_batch(payload: BatchAutocodeRequest):
+    m: Matcher = STATE["matcher"]  # type: ignore
+    qid = payload.question_id
+
+    # Optional: ensure qid exists early
+    if qid not in m.codeframes:
+        raise HTTPException(status_code=400, detail=f"Unknown question_id '{qid}'")
+
+    results: List[BatchAutocodeItem] = []
+    for verb in payload.verbatims:
+        try:
+            res = m.match(qid, verb)
+        except Exception as e:
+            results.append(BatchAutocodeItem(
+                input=verb,
+                matched_label=None,
+                code=None if qid != "Q1a" else 98,  # still fail-soft; Q1a would fallback in match()
+                confidence=0.0,
+                method=None,
+                matched_alias_or_term=None,
+                extras={"error": "match_exception", "detail": str(e)}
+            ))
+            continue
+
+        if not res:
+            # Non-Q1a: no match -> null; Q1a: match() already fallbacked to 98
+            results.append(BatchAutocodeItem(
+                input=verb,
+                matched_label=None,
+                code=None,
+                confidence=0.0,
+                method=None,
+                matched_alias_or_term=None,
+                extras={"reason": "no_match"}
+            ))
+            continue
+
+        label, code, conf, method, term, top = res
+        results.append(BatchAutocodeItem(
+            input=verb,
+            matched_label=label,
+            code=code,
+            confidence=conf,
+            method=method,
+            matched_alias_or_term=term,
+            extras={"top_candidates": top}
+        ))
+
+    return BatchAutocodeResponse(question_id=qid, results=results)
