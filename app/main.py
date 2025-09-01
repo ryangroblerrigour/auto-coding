@@ -5,19 +5,36 @@ import csv, os, re, unicodedata
 from rapidfuzz import process, fuzz
 
 # ------------------
-# loader
+# loader (robust)
 # ------------------
 def load_codeframes(path: str):
     out = {}
+    if not os.path.isdir(path):
+        print(f"[load_codeframes] Directory not found: {path}")
+        return out
     for fname in os.listdir(path):
-        if fname.lower().endswith(".csv"):
-            qid = os.path.splitext(fname)[0]
-            out[qid] = {}
-            with open(os.path.join(path, fname), newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    label = row["label"].strip()
-                    code = int(row["code"])
-                    out[qid][label] = (label, code)
+        if not fname.lower().endswith(".csv"):
+            continue
+        qid = os.path.splitext(fname)[0]
+        fpath = os.path.join(path, fname)
+        rows = 0
+        out[qid] = {}
+        with open(fpath, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "label" not in reader.fieldnames or "code" not in reader.fieldnames:
+                raise RuntimeError(f"{fname}: CSV must have header 'label,code' (found {reader.fieldnames})")
+            for row in reader:
+                lbl = (row.get("label") or "").strip()
+                code_str = (row.get("code") or "").strip()
+                if not lbl or not code_str:
+                    continue
+                try:
+                    code = int(float(code_str))
+                except ValueError:
+                    raise RuntimeError(f"{fname}: non-integer 'code' value: {code_str}")
+                out[qid][lbl] = (lbl, code)
+                rows += 1
+        print(f"[load_codeframes] {fname}: loaded {rows} rows")
     return out
 
 # ------------------
@@ -48,6 +65,8 @@ class Matcher:
             return None
         labels_map = self.codeframes[qid]
         canon_labels = list(labels_map.keys())
+        if not canon_labels:
+            return None  # nothing to match
 
         norm_text = normalize(verbatim)
         ctext = compact(norm_text)
@@ -55,20 +74,23 @@ class Matcher:
         # 1) substring check
         for label in canon_labels:
             nlbl = self.norm_labels[qid][label]
-            if nlbl in norm_text or compact(nlbl) in ctext:
+            if nlbl and (nlbl in norm_text or compact(nlbl) in ctext):
                 _, code = labels_map[label]
                 return (label, code, 0.92, "substring", nlbl, [(label, 92)])
 
-        # 2) fuzzy
-        def scorer(q, choice):
-            return 0.6 * fuzz.token_set_ratio(q, choice) + 0.4 * fuzz.partial_ratio(q, choice)
+        # 2) fuzzy (guard for empty choices)
+        try:
+            def scorer(q, choice):
+                return 0.6 * fuzz.token_set_ratio(q, choice) + 0.4 * fuzz.partial_ratio(q, choice)
+            choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
+            if not choices_map:
+                return None
+            extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
+        except Exception as e:
+            # fail-soft: no hard crash
+            print(f"[match] fuzzy extract error: {e}")
+            return None
 
-        extracted = process.extract(
-            norm_text,
-            {label: self.norm_labels[qid][label] for label in canon_labels},
-            scorer=scorer,
-            limit=3
-        )
         if extracted:
             top_label, top_score, _ = extracted[0]
             second = extracted[1][1] if len(extracted) > 1 else 0
@@ -87,7 +109,7 @@ class Matcher:
 # ------------------
 # fastapi app
 # ------------------
-app = FastAPI(title="Autocoder API", version="1.0.0")
+app = FastAPI(title="Autocoder API", version="1.0.1")
 
 STATE = {"matcher": None}
 
@@ -99,7 +121,7 @@ init()
 
 class AutocodeRequest(BaseModel):
     question_id: str
-    verbatim: str
+    verbatim: str  # brand text only is fine
 
 class AutocodeResponse(BaseModel):
     question_id: str
@@ -115,8 +137,49 @@ class AutocodeResponse(BaseModel):
 def health():
     return {"status": "ok"}
 
+# debug helper so you can see what loaded
+@app.get("/debug/codeframes")
+def debug_codeframes():
+    cf = STATE["matcher"].codeframes if STATE.get("matcher") else {}
+    return {qid: len(labels) for qid, labels in cf.items()}
+
 @app.post("/autocode", response_model=AutocodeResponse)
 def autocode(payload: AutocodeRequest):
-    res = STATE["matcher"].match(payload.question_id, payload.verbatim)
+    try:
+        res = STATE["matcher"].match(payload.question_id, payload.verbatim)
+    except Exception as e:
+        # clear message instead of 500
+        return AutocodeResponse(
+            question_id=payload.question_id,
+            input=payload.verbatim,
+            matched_label=None,
+            code=None,
+            confidence=0.0,
+            method=None,
+            matched_alias_or_term=None,
+            extras={"error": "match_exception", "detail": str(e)},
+        )
+
     if not res:
-        return Aut
+        return AutocodeResponse(
+            question_id=payload.question_id,
+            input=payload.verbatim,
+            matched_label=None,
+            code=None,
+            confidence=0.0,
+            method=None,
+            matched_alias_or_term=None,
+            extras={"reason": "no_match"},
+        )
+
+    label, code, conf, method, term, top = res
+    return AutocodeResponse(
+        question_id=payload.question_id,
+        input=payload.verbatim,
+        matched_label=label,
+        code=code,
+        confidence=conf,
+        method=method,
+        matched_alias_or_term=term,
+        extras={"top_candidates": top},
+    )
