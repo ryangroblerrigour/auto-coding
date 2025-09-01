@@ -145,9 +145,13 @@ class Matcher:
                 return (label, code, 0.92, "substring", nlbl, [(label, 92)])
 
         # 2) fuzzy (slightly more permissive to catch 1-char typos like 'cadillc')
-        def scorer(q, choice):
-            # Weighted ensemble; WRatio is good too, but this stays consistent with your current setup
-            return 0.6 * fuzz.token_set_ratio(q, choice) + 0.4 * fuzz.partial_ratio(q, choice)
+        def scorer(q, choice, *, score_cutoff=0):
+    # Pass score_cutoff through to each metric so RapidFuzz won't error
+    s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
+    s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
+    # Weighted ensemble
+    return 0.6 * s1 + 0.4 * s2
+
 
         choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
         extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
