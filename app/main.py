@@ -9,11 +9,6 @@ from rapidfuzz import process, fuzz
 # =========================
 
 def load_codeframes(path: str) -> Dict[str, Dict[str, tuple]]:
-    """
-    Reads all CSVs in ./codeframes and returns:
-      {question_id: {canonical_label: (canonical_label, code)}}
-    CSVs must have headers: label,code
-    """
     out: Dict[str, Dict[str, tuple]] = {}
     if not os.path.isdir(path):
         print(f"[load_codeframes] Directory not found: {path}")
@@ -51,19 +46,19 @@ def load_codeframes(path: str) -> Dict[str, Dict[str, tuple]]:
 
 
 def load_aliases(fp: str) -> Dict[str, Dict[str, str]]:
-    """
-    Loads manual aliases JSON:
-      { "Q1a": { "volkswagen": "VW", ... }, "f3": { ... } }
-    RHS (canonical) MUST exactly match a label in the corresponding CSV.
-    """
     if not os.path.exists(fp):
         print(f"[load_aliases] No alias file at {fp} (skipping)")
         return {}
-    with open(fp, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        if not isinstance(data, dict):
-            raise RuntimeError("[load_aliases] aliases.json root must be an object")
-        return data
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[load_aliases] JSON decode error in {fp}: {e}")
+        return {}
+    if not isinstance(data, dict):
+        print("[load_aliases] aliases.json root must be an object; ignoring")
+        return {}
+    return data
 
 # =========================
 # Normalization helpers
@@ -73,9 +68,9 @@ def normalize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
-    s = re.sub(r"[()]", " ", s)            # drop parentheses for matching
-    s = re.sub(r"[\.\-_/]", " ", s)        # break punctuation
-    s = re.sub(r"\b&\b", " and ", s)       # & -> and
+    s = re.sub(r"[()]", " ", s)
+    s = re.sub(r"[\.\-_/]", " ", s)
+    s = re.sub(r"\b&\b", " and ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -88,10 +83,10 @@ def compact(s: str) -> str:
 
 class Matcher:
     def __init__(self, codeframes: Dict[str, Dict[str, tuple]], manual_aliases: Optional[Dict[str, Dict[str, str]]] = None):
-        self.codeframes = codeframes                      # {qid: {label: (label, code)}}
-        self.manual_aliases = manual_aliases or {}        # {qid: {alias_text: canonical_label}}
-        self.norm_labels: Dict[str, Dict[str, str]] = {}  # {qid: {label: normalized_label}}
-        self.auto_aliases: Dict[str, Dict[str, str]] = {} # {qid: {alias_norm_or_compact: canonical_label}}
+        self.codeframes = codeframes
+        self.manual_aliases = manual_aliases or {}
+        self.norm_labels: Dict[str, Dict[str, str]] = {}
+        self.auto_aliases: Dict[str, Dict[str, str]] = {}
 
         for qid, labels in self.codeframes.items():
             self.norm_labels[qid] = {}
@@ -101,132 +96,118 @@ class Matcher:
                 nlbl = normalize(lbl)
                 self.norm_labels[qid][lbl] = nlbl
 
-                # Build lightweight auto-aliases from the label itself
-                base = re.sub(r"\s*\([^)]*\)", "", lbl).strip()  # remove parenthetical like (VW)
+                base = re.sub(r"\s*\([^)]*\)", "", lbl).strip()
                 nbase = normalize(base)
-                clbl  = compact(nlbl)
+                clbl = compact(nlbl)
                 cbase = compact(nbase)
 
-                # Add normalized base label + compact forms as aliases to the canonical label
                 if nbase:
                     self.auto_aliases[qid].setdefault(nbase, lbl)
                 if cbase:
                     self.auto_aliases[qid].setdefault(cbase, lbl)
                 if clbl:
-                    self.auto_aliases[qid].setdefault(clbl,  lbl)
+                    self.auto_aliases[qid].setdefault(clbl, lbl)
 
-            # Merge manual aliases — normalize keys; only keep entries with existing canonical labels
             for raw_alias, canonical in self.manual_aliases.get(qid, {}).items():
                 na = normalize(raw_alias)
                 if canonical in self.codeframes[qid]:
                     self.auto_aliases[qid].setdefault(na, canonical)
                     self.auto_aliases[qid].setdefault(compact(na), canonical)
 
-   def match(self, qid: str, verbatim: str):
-    if not verbatim or not verbatim.strip():
-        # empty input for Q1a → 97 (None)
+    def match(self, qid: str, verbatim: str):
+        if not verbatim or not verbatim.strip():
+            # empty input for Q1a → 97 (None)
+            if qid == "Q1a":
+                return ("None", 97, 1.0, "rule-empty", None, [])
+            return None
+
+        if qid not in self.codeframes:
+            return None
+
+        text = verbatim.strip()
+        norm_text = normalize(text)
+        ctext = compact(norm_text)
+
+        # =============================
+        # Q1a special rules
+        # =============================
         if qid == "Q1a":
-            return ("None", 97, 1.0, "rule-empty", None, [])
-        return None
+            # 1) Cyrillic
+            if re.search(r"[\u0400-\u04FF]", text):
+                return ("Cyrillic", 95, 1.0, "rule-cyrillic", None, [])
+            # 2) No / none / nothing
+            if re.search(r"\b(no|none|nothing)\b", norm_text):
+                return ("None", 97, 1.0, "rule-none", None, [])
+            # 3) Don't know / dk / no idea
+            if re.search(r"\b(dk|don.?t know|dont know|no idea)\b", norm_text):
+                return ("DontKnow", 99, 1.0, "rule-dk", None, [])
 
-    if qid not in self.codeframes:
-        return None
+        # =============================
+        # Normal alias / substring / fuzzy
+        # =============================
+        labels_map = self.codeframes[qid]
+        canon_labels = list(labels_map.keys())
+        if not canon_labels:
+            if qid == "Q1a":
+                return ("Other", 98, 1.0, "rule-empty-frame", None, [])
+            return None
 
-    text = verbatim.strip()
-    norm_text = normalize(text)
-    ctext = compact(norm_text)
-
-    # =============================
-    # Q1a special rules
-    # =============================
-    if qid == "Q1a":
-        # 1) Cyrillic check
-        if re.search(r"[\u0400-\u04FF]", text):
-            return ("Cyrillic", 95, 1.0, "rule-cyrillic", None, [])
-
-        # 2) No / none / nothing
-        if re.search(r"\b(no|none|nothing)\b", norm_text):
-            return ("None", 97, 1.0, "rule-none", None, [])
-
-        # 3) Don't know / dk / no idea
-        if re.search(r"\b(dk|don.?t know|dont know|no idea)\b", norm_text):
-            return ("DontKnow", 99, 1.0, "rule-dk", None, [])
-
-    # =============================
-    # Normal alias / substring / fuzzy logic
-    # =============================
-    labels_map = self.codeframes[qid]
-    canon_labels = list(labels_map.keys())
-    if not canon_labels:
-        if qid == "Q1a":
-            return ("Other", 98, 1.0, "rule-empty-frame", None, [])
-        return None
-
-    # --- alias quick hits
-    aliases = self.auto_aliases.get(qid, {})
-    if norm_text in aliases:
-        canonical = aliases[norm_text]
-        _, code = labels_map[canonical]
-        return (canonical, code, 0.99, "alias", norm_text, [(canonical, 99)])
-    if ctext in aliases:
-        canonical = aliases[ctext]
-        _, code = labels_map[canonical]
-        return (canonical, code, 0.99, "alias", ctext, [(canonical, 99)])
-
-    for a, canonical in aliases.items():
-        if a and (a in norm_text or a in ctext):
+        aliases = self.auto_aliases.get(qid, {})
+        if norm_text in aliases:
+            canonical = aliases[norm_text]
             _, code = labels_map[canonical]
-            return (canonical, code, 0.96, "alias-sub", a, [(canonical, 96)])
+            return (canonical, code, 0.99, "alias", norm_text, [(canonical, 99)])
+        if ctext in aliases:
+            canonical = aliases[ctext]
+            _, code = labels_map[canonical]
+            return (canonical, code, 0.99, "alias", ctext, [(canonical, 99)])
+        for a, canonical in aliases.items():
+            if a and (a in norm_text or a in ctext):
+                _, code = labels_map[canonical]
+                return (canonical, code, 0.96, "alias-sub", a, [(canonical, 96)])
 
-    # --- substring check
-    for label in canon_labels:
-        nlbl = self.norm_labels[qid][label]
-        if not nlbl:
-            continue
-        if (nlbl in norm_text or norm_text in nlbl or
-            compact(nlbl) in ctext or ctext in compact(nlbl)):
-            _, code = labels_map[label]
-            return (label, code, 0.92, "substring", nlbl, [(label, 92)])
+        for label in canon_labels:
+            nlbl = self.norm_labels[qid][label]
+            if not nlbl:
+                continue
+            if (nlbl in norm_text or norm_text in nlbl or
+                compact(nlbl) in ctext or ctext in compact(nlbl)):
+                _, code = labels_map[label]
+                return (label, code, 0.92, "substring", nlbl, [(label, 92)])
 
-    # --- fuzzy match
-    def scorer(q, choice, *, score_cutoff=0):
-        s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
-        s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
-        return 0.6 * s1 + 0.4 * s2
+        def scorer(q, choice, *, score_cutoff=0):
+            s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
+            s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
+            return 0.6 * s1 + 0.4 * s2
 
-    choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
-    extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
+        choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
+        extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
 
-    if extracted:
-        top_label, top_score, _ = extracted[0]
-        second = extracted[1][1] if len(extracted) > 1 else 0
-        threshold = 75
-        margin = 5
-        if top_score >= threshold and (top_score - second) >= margin:
-            _, code = labels_map[top_label]
-            return (
-                top_label,
-                code,
-                min(1.0, top_score / 100.0),
-                "fuzzy",
-                self.norm_labels[qid][top_label],
-                [(lab, int(sc)) for (lab, sc, __) in extracted],
-            )
+        if extracted:
+            top_label, top_score, _ = extracted[0]
+            second = extracted[1][1] if len(extracted) > 1 else 0
+            if top_score >= 75 and (top_score - second) >= 5:
+                _, code = labels_map[top_label]
+                return (
+                    top_label,
+                    code,
+                    min(1.0, top_score / 100.0),
+                    "fuzzy",
+                    self.norm_labels[qid][top_label],
+                    [(lab, int(sc)) for (lab, sc, __) in extracted],
+                )
 
-    # =============================
-    # Q1a fallback → 98 (Other)
-    # =============================
-    if qid == "Q1a":
-        return ("Other", 98, 1.0, "rule-fallback", None, [])
+        # Fallback for Q1a
+        if qid == "Q1a":
+            return ("Other", 98, 1.0, "rule-fallback", None, [])
 
-    return None
-
+        return None
 
 # =========================
 # FastAPI app
 # =========================
 
-app = FastAPI(title="Autocoder API", version="1.1.0")
+app = FastAPI(title="Autocoder API", version="1.2.0")
 STATE: Dict[str, object] = {"matcher": None}
 
 def init():
@@ -237,8 +218,8 @@ def init():
 init()
 
 class AutocodeRequest(BaseModel):
-    question_id: str  # must match CSV filename without .csv (case-sensitive)
-    verbatim: str     # brand text only is fine
+    question_id: str
+    verbatim: str
 
 class AutocodeResponse(BaseModel):
     question_id: str
@@ -254,7 +235,6 @@ class AutocodeResponse(BaseModel):
 def health():
     return {"status": "ok"}
 
-# Debug helper: counts per frame
 @app.get("/debug/codeframes")
 def debug_codeframes():
     m: Matcher = STATE.get("matcher")  # type: ignore
@@ -262,7 +242,6 @@ def debug_codeframes():
         return {}
     return {qid: len(labels) for qid, labels in m.codeframes.items()}
 
-# Debug helper: alias counts per frame
 @app.get("/debug/aliases")
 def debug_aliases():
     m: Matcher = STATE.get("matcher")  # type: ignore
@@ -276,7 +255,6 @@ def autocode(payload: AutocodeRequest):
         m: Matcher = STATE["matcher"]  # type: ignore
         res = m.match(payload.question_id, payload.verbatim)
     except Exception as e:
-        # fail-soft: return detail in extras rather than 500
         return AutocodeResponse(
             question_id=payload.question_id,
             input=payload.verbatim,
