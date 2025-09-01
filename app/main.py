@@ -122,71 +122,105 @@ class Matcher:
                     self.auto_aliases[qid].setdefault(na, canonical)
                     self.auto_aliases[qid].setdefault(compact(na), canonical)
 
-    def match(self, qid: str, verbatim: str):
-        if not verbatim or not verbatim.strip():
-            return None
-        if qid not in self.codeframes:
-            return None
-
-        labels_map = self.codeframes[qid]  # {label: (label, code)}
-        canon_labels = list(labels_map.keys())
-        if not canon_labels:
-            return None
-
-        norm_text = normalize(verbatim)
-        ctext = compact(norm_text)
-
-        # 0) alias quick hits (manual + auto)
-        aliases = self.auto_aliases.get(qid, {})
-        if norm_text in aliases:
-            canonical = aliases[norm_text]
-            _, code = labels_map[canonical]
-            return (canonical, code, 0.99, "alias", norm_text, [(canonical, 99)])
-        if ctext in aliases:
-            canonical = aliases[ctext]
-            _, code = labels_map[canonical]
-            return (canonical, code, 0.99, "alias", ctext, [(canonical, 99)])
-        # alias substring containment (e.g., 'volks wagon' inside input)
-        for a, canonical in aliases.items():
-            if a and (a in norm_text or a in ctext):
-                _, code = labels_map[canonical]
-                return (canonical, code, 0.96, "alias-sub", a, [(canonical, 96)])
-
-        # 1) bidirectional substring on canonical labels
-        for label in canon_labels:
-            nlbl = self.norm_labels[qid][label]
-            if not nlbl:
-                continue
-            if (nlbl in norm_text or norm_text in nlbl or
-                compact(nlbl) in ctext or ctext in compact(nlbl)):
-                _, code = labels_map[label]
-                return (label, code, 0.92, "substring", nlbl, [(label, 92)])
-
-        # 2) fuzzy (with scorer that supports score_cutoff)
-        def scorer(q, choice, *, score_cutoff=0):
-            s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
-            s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
-            return 0.6 * s1 + 0.4 * s2
-
-        choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
-        extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
-
-        if extracted:
-            top_label, top_score, _ = extracted[0]
-            second = extracted[1][1] if len(extracted) > 1 else 0
-            threshold = 75
-            margin = 5
-            if top_score >= threshold and (top_score - second) >= margin:
-                _, code = labels_map[top_label]
-                return (
-                    top_label,
-                    code,
-                    min(1.0, top_score / 100.0),
-                    "fuzzy",
-                    self.norm_labels[qid][top_label],
-                    [(lab, int(sc)) for (lab, sc, __) in extracted],
-                )
+   def match(self, qid: str, verbatim: str):
+    if not verbatim or not verbatim.strip():
+        # empty input for Q1a → 97 (None)
+        if qid == "Q1a":
+            return ("None", 97, 1.0, "rule-empty", None, [])
         return None
+
+    if qid not in self.codeframes:
+        return None
+
+    text = verbatim.strip()
+    norm_text = normalize(text)
+    ctext = compact(norm_text)
+
+    # =============================
+    # Q1a special rules
+    # =============================
+    if qid == "Q1a":
+        # 1) Cyrillic check
+        if re.search(r"[\u0400-\u04FF]", text):
+            return ("Cyrillic", 95, 1.0, "rule-cyrillic", None, [])
+
+        # 2) No / none / nothing
+        if re.search(r"\b(no|none|nothing)\b", norm_text):
+            return ("None", 97, 1.0, "rule-none", None, [])
+
+        # 3) Don't know / dk / no idea
+        if re.search(r"\b(dk|don.?t know|dont know|no idea)\b", norm_text):
+            return ("DontKnow", 99, 1.0, "rule-dk", None, [])
+
+    # =============================
+    # Normal alias / substring / fuzzy logic
+    # =============================
+    labels_map = self.codeframes[qid]
+    canon_labels = list(labels_map.keys())
+    if not canon_labels:
+        if qid == "Q1a":
+            return ("Other", 98, 1.0, "rule-empty-frame", None, [])
+        return None
+
+    # --- alias quick hits
+    aliases = self.auto_aliases.get(qid, {})
+    if norm_text in aliases:
+        canonical = aliases[norm_text]
+        _, code = labels_map[canonical]
+        return (canonical, code, 0.99, "alias", norm_text, [(canonical, 99)])
+    if ctext in aliases:
+        canonical = aliases[ctext]
+        _, code = labels_map[canonical]
+        return (canonical, code, 0.99, "alias", ctext, [(canonical, 99)])
+
+    for a, canonical in aliases.items():
+        if a and (a in norm_text or a in ctext):
+            _, code = labels_map[canonical]
+            return (canonical, code, 0.96, "alias-sub", a, [(canonical, 96)])
+
+    # --- substring check
+    for label in canon_labels:
+        nlbl = self.norm_labels[qid][label]
+        if not nlbl:
+            continue
+        if (nlbl in norm_text or norm_text in nlbl or
+            compact(nlbl) in ctext or ctext in compact(nlbl)):
+            _, code = labels_map[label]
+            return (label, code, 0.92, "substring", nlbl, [(label, 92)])
+
+    # --- fuzzy match
+    def scorer(q, choice, *, score_cutoff=0):
+        s1 = fuzz.token_set_ratio(q, choice, score_cutoff=score_cutoff)
+        s2 = fuzz.partial_ratio(q, choice, score_cutoff=score_cutoff)
+        return 0.6 * s1 + 0.4 * s2
+
+    choices_map = {label: self.norm_labels[qid][label] for label in canon_labels}
+    extracted = process.extract(norm_text, choices_map, scorer=scorer, limit=3)
+
+    if extracted:
+        top_label, top_score, _ = extracted[0]
+        second = extracted[1][1] if len(extracted) > 1 else 0
+        threshold = 75
+        margin = 5
+        if top_score >= threshold and (top_score - second) >= margin:
+            _, code = labels_map[top_label]
+            return (
+                top_label,
+                code,
+                min(1.0, top_score / 100.0),
+                "fuzzy",
+                self.norm_labels[qid][top_label],
+                [(lab, int(sc)) for (lab, sc, __) in extracted],
+            )
+
+    # =============================
+    # Q1a fallback → 98 (Other)
+    # =============================
+    if qid == "Q1a":
+        return ("Other", 98, 1.0, "rule-fallback", None, [])
+
+    return None
+
 
 # =========================
 # FastAPI app
