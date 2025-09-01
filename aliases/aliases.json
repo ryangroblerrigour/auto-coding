@@ -1,7 +1,11 @@
 {
   "Q1a": {
-    "volkswagen": "VW"
+    "volkswagen": "VW",
+    "volks wagon": "VW",
+    "volkswagon": "VW",
+    "vw": "VW",
+    "cadillc": "Cadillac",
+    "caddilac": "Cadillac"
   },
   "f3": {}
 }
-
