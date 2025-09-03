@@ -198,15 +198,19 @@ class Matcher:
                     [(lab, int(sc)) for (lab, sc, __) in extracted],
                 )
 
-        # Q1a fallback → 98 (Other)
-        if qid == "Q1a":
-            return ("Other", 98, 1.0, "rule-fallback", None, [])
+    # =============================
+    # Fallbacks
+    # =============================
 
-        # F3 fallback → 998 (Other F3)
-        if qid == "F3":
-            return ("Other", 998, 1.0, "rule-fallback", None, [])
+    # Q1a fallback → 98 (Other)
+    if qid == "Q1a":
+        return ("Other", 98, 1.0, "rule-fallback", None, [])
 
-        return None
+    # F3 fallback → 998 (Other) — only when input is non-empty
+    if qid == "F3" and verbatim.strip():
+        return ("Other", 998, 1.0, "rule-fallback", None, [])
+
+    return None
 
 # =========================
 # FastAPI app
