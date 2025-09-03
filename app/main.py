@@ -202,6 +202,10 @@ class Matcher:
         if qid == "Q1a":
             return ("Other", 98, 1.0, "rule-fallback", None, [])
 
+        # F3 fallback → 998 (Other F3)
+        if qid == "F3":
+            return ("Other", 998, 1.0, "rule-fallback", None, [])
+
         return None
 
 # =========================
